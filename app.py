@@ -1,9 +1,9 @@
-    import os
-    from pathlib import Path
-    from datetime import datetime, timedelta
-    import pytz
-    import pandas as pd
-    import streamlit as st
+import os
+from pathlib import Path
+from datetime import datetime, timedelta
+import pytz
+import pandas as pd
+import streamlit as st
 
     # Third-party (unofficial Garmin API)
     try:
