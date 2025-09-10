@@ -58,7 +58,6 @@ with colB:
     end_dt = now_tz
     st.write(f"**Range:** {start_dt.strftime('%Y-%m-%d %H:%M')} → {end_dt.strftime('%Y-%m-%d %H:%M')}")
 with colC:
-    # This is the updated button handler
     fetch_clicked = st.button("🔄 Fetch past week")
 
 # ---------------------------
@@ -78,10 +77,7 @@ def get_client(
 ) -> tuple[Garmin, dict]:
     """
     Returns (garmin_client, status_info)
-
-    status_info has small details to display in the UI for debugging:
-      - phase: which step we're in
-      - detail: human-readable info about that step
+    status_info has small details to display in the UI for debugging.
     """
     tokens_path = Path(tokens_dir).expanduser()
     status = {"phase": None, "detail": None}
@@ -105,10 +101,9 @@ def get_client(
         status.update({"phase": "cred_login_failed", "detail": str(e)})
         raise
 
-    # If Garmin requires MFA, you typically receive the email *after* this step
+    # If Garmin requires MFA
     if result1 == "needs_mfa":
         if not mfa_code:
-            # Often Garmin also needs "new device/login" approval in the Connect app before the email will arrive
             raise MFARequired("MFA required—check your Connect app for any new-device approval, then paste the emailed code and click again.")
         g.resume_login(result2, mfa_code)
         status.update({"phase": "mfa_resume", "detail": "MFA code accepted"})
@@ -123,7 +118,6 @@ def get_client(
 # Data helpers
 # ---------------------------
 def fetch_week_activities(client: Garmin, start_iso: str, end_iso: str):
-    # Preferred by-date API (may vary by account/library version)
     try:
         return client.get_activities_by_date(start_iso, end_iso)
     except Exception:
@@ -166,15 +160,13 @@ def normalize_activities(activities):
         })
 
     df = pd.DataFrame(rows)
-    
-    # Make all datetimes tz-naive for consistent comparisons
+
+    # Normalize datetime: make tz-naive for consistent comparisons
     df["date"] = pd.to_datetime(df["date"], errors="coerce")
-    # If any timezone is present, strip it (make naive)
     if getattr(df["date"].dt, "tz", None) is not None:
         df["date"] = df["date"].dt.tz_localize(None)
-    
-    df = df.sort_values("date", ascending=False)
 
+    df = df.sort_values("date", ascending=False)
     return df
 
 def summarize(df):
@@ -205,8 +197,12 @@ def summarize(df):
     by_type["avg_speed_kmh"] = by_type["avg_speed_kmh"].round(1)
     return totals, by_type
 
+def _to_naive_ts(dt):
+    ts = pd.Timestamp(dt)
+    return ts.tz_convert(None) if ts.tz is not None else ts
+
 # ---------------------------
-# Updated button handler
+# Button handler
 # ---------------------------
 if fetch_clicked:
     if not email or not password:
@@ -242,7 +238,6 @@ if fetch_clicked:
             st.error(f"Unexpected error: {e}")
             st.stop()
 
-    # Tiny debug panel so you can see what happened during login
     with st.expander("Login status (debug)"):
         st.write(status)
 
@@ -260,15 +255,9 @@ if fetch_clicked:
         st.info("No activities found in the past week.")
         st.stop()
 
-
-    def _to_naive_ts(dt):
-    ts = pd.Timestamp(dt)
-    # If tz-aware, drop timezone; else return as-is
-    return ts.tz_convert(None) if ts.tz is not None else ts
-
+    # Use tz-naive comparison
     start_naive = _to_naive_ts(start_dt)
     end_naive = _to_naive_ts(end_dt)
-
     mask = (df["date"] >= start_naive) & (df["date"] <= end_naive)
     df_week = df.loc[mask].copy()
 
@@ -289,7 +278,6 @@ if fetch_clicked:
     show_cols = ["date", "type", "name", "distance_km", "duration_min", "avg_hr", "max_hr", "avg_power", "max_power", "avg_speed_kmh"]
     st.dataframe(df_week[show_cols], use_container_width=True)
 
-    # Charts (matplotlib, single-plot each, no explicit colors)
     import matplotlib.pyplot as plt
 
     # Time by Day
@@ -322,4 +310,5 @@ if fetch_clicked:
     )
 else:
     st.info("Enter your Garmin credentials and click **Fetch past week** to begin.")
+
 
