@@ -39,6 +39,20 @@ st.title("🏁 Garmin Coach (Unofficial)")
 st.caption("Logs in to Garmin, summarizes your past week's activities, and generates a tailored 7-day coaching plan. MFA + token reuse enabled. Note: uses an **unofficial** Garmin library.")
 
 # ---------------------------
+# Session defaults
+# ---------------------------
+for k, v in {
+    "data_ready": False,
+    "df_week": None,
+    "totals": None,
+    "by_type": None,
+    "plan_text": "",
+    "plan_json": None,
+    "df_plan": None,
+}.items():
+    st.session_state.setdefault(k, v)
+
+# ---------------------------
 # Credentials / Inputs
 # ---------------------------
 st.subheader("🔐 Garmin Login")
@@ -72,7 +86,7 @@ with colC:
     fetch_clicked = st.button("🔄 Fetch past week")
 
 # ---------------------------
-# Athlete metrics + goal (NEW)
+# Athlete metrics + goal (always editable)
 # ---------------------------
 st.subheader("🏃 Athlete Metrics & Goal")
 m1, m2, m3 = st.columns(3)
@@ -85,7 +99,7 @@ with m2:
 with m3:
     vo2 = st.number_input("VO₂max (ml/kg/min)", min_value=0, max_value=100, value=53, step=1)
 goal_text = st.text_area("Training goal (include constraints like weekly race day, time limits, focus areas)", height=80,
-                         placeholder="e.g., Raise FTP to 280W by December, Tuesday Zwift race, long Z2 Saturday, avoid >8h weekly load, focus on threshold & VO2 touches…")
+                         placeholder="e.g., Raise FTP to 280W by December, Tuesday Zwift race, long Z2 Saturday, <8h weekly, threshold & VO2 touches…")
 
 # ---------------------------
 # Login helper (MFA-aware)
@@ -275,7 +289,6 @@ def extract_plan_json(text: str):
     return None
 
 def build_context_payload(df_week: pd.DataFrame, totals: dict, inputs: dict):
-    # compact activity sample
     sample_cols = ["date","type","name","distance_km","duration_min","avg_hr","avg_power","np_power","avg_speed_kmh"]
     adf_light = (
         df_week[sample_cols].copy()
@@ -283,7 +296,6 @@ def build_context_payload(df_week: pd.DataFrame, totals: dict, inputs: dict):
                .assign(date=lambda d: d["date"].astype(str))
                .to_dict("records")
     )
-    # simple weekly bucket by type
     weekly_by_type = (
         df_week.groupby("type")
                .agg(sessions=("type","count"),
@@ -297,7 +309,7 @@ def build_context_payload(df_week: pd.DataFrame, totals: dict, inputs: dict):
     start_day = date.today() + timedelta(days=1)
     week_dates = [(start_day + timedelta(days=i)).isoformat() for i in range(7)]
 
-    pack = {
+    return {
         "generated_on": date.today().isoformat(),
         "plan_dates": week_dates,
         "goal_text": inputs.get("goal_text",""),
@@ -312,7 +324,6 @@ def build_context_payload(df_week: pd.DataFrame, totals: dict, inputs: dict):
         "weekly_by_type": weekly_by_type,
         "recent_activities_light": adf_light,
     }
-    return pack
 
 def generate_plan(client, context_pack: dict):
     system_prompt = (
@@ -322,11 +333,7 @@ def generate_plan(client, context_pack: dict):
         "Keep weekly load reasonable; avoid sudden spikes."
     )
     schema_block = """{
-      "week_overview": {
-        "intended_load_sum": number,
-        "key_objectives": [string, ...],
-        "notes": string
-      },
+      "week_overview": { "intended_load_sum": number, "key_objectives": [string, ...], "notes": string },
       "days": {
         "<ISO date>": {
           "workout_name": string,
@@ -385,7 +392,7 @@ def chat_with_coach(client, plan_text: str, plan_json: dict, question: str):
     return resp.choices[0].message.content
 
 # ---------------------------
-# Main button: fetch & summarize
+# Fetch button: login + fetch + hydrate; store in session_state
 # ---------------------------
 if fetch_clicked:
     if not email or not password:
@@ -447,10 +454,22 @@ if fetch_clicked:
     end_naive = _to_naive_ts(end_dt)
     mask = (df["date"] >= start_naive) & (df["date"] <= end_naive)
     df_week = df.loc[mask].copy()
-
     totals, by_type = summarize(df_week)
 
-    # ---------- UI: Weekly Summary (no charts) ----------
+    # Persist data across reruns
+    st.session_state["data_ready"] = True
+    st.session_state["df_week"] = df_week
+    st.session_state["totals"] = totals
+    st.session_state["by_type"] = by_type
+
+# ---------------------------
+# If data is ready, render summary + plan/chat UI (outside the fetch block)
+# ---------------------------
+if st.session_state["data_ready"]:
+    df_week = st.session_state["df_week"]
+    totals = st.session_state["totals"]
+    by_type = st.session_state["by_type"]
+
     st.subheader("📊 Weekly Totals")
     c1, c2, c3, c4, c5, c6, c7 = st.columns(7)
     c1.metric("Activities", totals.get("activities", 0))
@@ -468,15 +487,12 @@ if fetch_clicked:
     show_cols = ["date","type","name","distance_km","duration_min","avg_hr","max_hr","avg_power","max_power","np_power","avg_speed_kmh"]
     st.dataframe(df_week[show_cols], use_container_width=True)
 
-    # ---------- Generate Coaching Plan ----------
+    # ---------- Generate Coaching Plan (separate button; no re-login) ----------
     st.markdown("---")
     st.subheader("🧠 Generate Coaching Plan")
     if st.button("✨ Create 7-day plan"):
         client_oa = get_openai_client()
-        inputs = {
-            "ftp": ftp, "rhr": rhr, "mhr": mhr, "thr_hr": thr_hr, "vo2": vo2,
-            "goal_text": goal_text,
-        }
+        inputs = {"ftp": ftp, "rhr": rhr, "mhr": mhr, "thr_hr": thr_hr, "vo2": vo2, "goal_text": goal_text}
         ctx = build_context_payload(df_week, totals, inputs)
         with st.spinner("Assembling plan with OpenAI…"):
             plan_text, plan_json, df_plan = generate_plan(client_oa, ctx)
@@ -484,22 +500,21 @@ if fetch_clicked:
         st.session_state["plan_json"] = plan_json
         st.session_state["df_plan"] = df_plan
 
-    # If a plan already exists in session, show it
-    if "plan_text" in st.session_state and st.session_state["plan_text"]:
+    if st.session_state.get("plan_text"):
         st.markdown("### 📄 Coach Plan (summary + JSON)")
         st.write(st.session_state["plan_text"])
         if isinstance(st.session_state.get("df_plan"), pd.DataFrame):
             st.markdown("**Day-by-Day Table**")
             st.dataframe(st.session_state["df_plan"], use_container_width=True)
 
-    # ---------- Coach Chat ----------
+    # ---------- Coach Chat (uses stored plan as context) ----------
     st.markdown("---")
     st.subheader("💬 Chat with your coach")
     chat_q = st.text_input("Ask about the plan, substitutions, or adjustments:")
     if st.button("Send to coach"):
         if not chat_q.strip():
             st.warning("Type a question first.")
-        elif "plan_text" not in st.session_state:
+        elif not st.session_state.get("plan_text"):
             st.warning("Generate a plan first so the coach has context.")
         else:
             client_oa = get_openai_client()
