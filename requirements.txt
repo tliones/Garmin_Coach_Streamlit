@@ -4,3 +4,4 @@ matplotlib>=3.8.0
 pytz>=2024.1
 garminconnect>=0.2.5
 garth>=0.4
+openai>=1.40.0
