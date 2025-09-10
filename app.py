@@ -165,7 +165,16 @@ def normalize_activities(activities):
             "avg_speed_kmh": (avg_speed * 3.6) if isinstance(avg_speed, (int, float)) else None,
         })
 
-    df = pd.DataFrame(rows).sort_values("date", ascending=False)
+    df = pd.DataFrame(rows)
+    
+    # Make all datetimes tz-naive for consistent comparisons
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    # If any timezone is present, strip it (make naive)
+    if getattr(df["date"].dt, "tz", None) is not None:
+        df["date"] = df["date"].dt.tz_localize(None)
+    
+    df = df.sort_values("date", ascending=False)
+
     return df
 
 def summarize(df):
@@ -251,8 +260,16 @@ if fetch_clicked:
         st.info("No activities found in the past week.")
         st.stop()
 
-    # Restrict exactly to the window
-    mask = (df["date"] >= pd.to_datetime(start_dt)) & (df["date"] <= pd.to_datetime(end_dt))
+
+    def _to_naive_ts(dt):
+    ts = pd.Timestamp(dt)
+    # If tz-aware, drop timezone; else return as-is
+    return ts.tz_convert(None) if ts.tz is not None else ts
+
+    start_naive = _to_naive_ts(start_dt)
+    end_naive = _to_naive_ts(end_dt)
+
+    mask = (df["date"] >= start_naive) & (df["date"] <= end_naive)
     df_week = df.loc[mask].copy()
 
     totals, by_type = summarize(df_week)
