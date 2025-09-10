@@ -2,6 +2,7 @@
 import os
 from pathlib import Path
 from datetime import datetime, timedelta
+import time
 
 import pandas as pd
 import pytz
@@ -26,7 +27,7 @@ except Exception:
 
 st.set_page_config(page_title="Garmin Weekly Summary", page_icon="⏱️", layout="wide")
 st.title("🏃‍♀️ Garmin Weekly Summary (Unofficial)")
-st.caption("Logs in to Garmin, handles MFA, caches tokens, and summarizes your past week's activities.")
+st.caption("Logs in to Garmin, handles MFA, caches tokens, and summarizes your past week's activities. Now with power hydration from detailed endpoints.")
 
 # ---------------------------
 # Inputs
@@ -44,6 +45,7 @@ with st.expander("Advanced: Token storage & behavior"):
     default_tokens_dir = Path(os.getenv("GARMINTOKENS", "~/.garminconnect")).expanduser()
     tok_dir_str = st.text_input("Token directory", value=str(default_tokens_dir))
     force_fresh = st.checkbox("Force fresh login (ignore saved tokens)", value=False)
+    hydrate_limit = st.number_input("Max activities to hydrate with details", min_value=1, max_value=500, value=60, step=5, help="How many recent activities to enrich with detailed power metrics if missing.")
 
 colA, colB, colC = st.columns([1, 1, 1])
 with colA:
@@ -118,11 +120,87 @@ def get_client(
 # Data helpers
 # ---------------------------
 def fetch_week_activities(client: Garmin, start_iso: str, end_iso: str):
+    """Fetch activities in date range; fall back to batch+filter."""
     try:
         return client.get_activities_by_date(start_iso, end_iso)
     except Exception:
         acts = client.get_activities(0, 200)
         return [a for a in acts if start_iso <= (a.get("startTimeLocal", a.get("startTimeGMT", ""))[:10]) <= end_iso]
+
+def _extract_power_from_detail(detail: dict) -> tuple[float | None, float | None, float | None]:
+    """
+    Try several known locations for power metrics. Returns (avg_power, max_power, np_power).
+    """
+    avg_p = max_p = np_p = None
+    if not isinstance(detail, dict):
+        return avg_p, max_p, np_p
+
+    # 1) summaryDTO (most reliable)
+    s = detail.get("summaryDTO") or {}
+    avg_p = avg_p or s.get("averagePower")
+    max_p = max_p or s.get("maxPower")
+    np_p  = np_p  or s.get("normalizedPower")
+
+    # 2) direct keys (some endpoints flatten)
+    avg_p = avg_p or detail.get("averagePower") or detail.get("avgPower")
+    max_p = max_p or detail.get("maxPower")
+    np_p  = np_p  or detail.get("normalizedPower")
+
+    # 3) powerData subobject
+    pdat = detail.get("powerData") or {}
+    if isinstance(pdat, dict):
+        avg_p = avg_p or pdat.get("avgPower") or pdat.get("averagePower")
+        max_p = max_p or pdat.get("maxPower")
+        np_p  = np_p  or pdat.get("normPower") or pdat.get("normalizedPower")
+
+    return avg_p, max_p, np_p
+
+def hydrate_power_metrics(client: Garmin, activities: list[dict], max_to_hydrate: int = 60, sleep_sec: float = 0.2) -> list[dict]:
+    """
+    For activities missing averagePower or maxPower, pull detailed info and fill values.
+    Limits calls for rate-safety.
+    """
+    if not activities:
+        return activities
+
+    hydrated = 0
+    for a in activities:
+        # If already have power, skip
+        if isinstance(a.get("averagePower"), (int, float)) and isinstance(a.get("maxPower"), (int, float)):
+            continue
+
+        # Only hydrate recent subset
+        if hydrated >= max_to_hydrate:
+            break
+
+        act_id = a.get("activityId") or a.get("activityUUID", {}).get("uuid")
+        if not act_id:
+            continue
+
+        detail = None
+        # Try a few detail endpoints in order of richness/availability
+        for getter in ("get_activity", "get_activity_summary", "get_activity_details"):
+            try:
+                detail = getattr(client, getter)(act_id)
+                if detail:
+                    break
+            except Exception:
+                detail = None
+
+        if detail:
+            avg_p, max_p, np_p = _extract_power_from_detail(detail)
+            if avg_p is not None:
+                a["averagePower"] = avg_p
+            if max_p is not None:
+                a["maxPower"] = max_p
+            # Stash NP if useful later
+            if np_p is not None:
+                a["normalizedPower"] = np_p
+
+            hydrated += 1
+            time.sleep(sleep_sec)  # be gentle with API
+
+    return activities
 
 def normalize_activities(activities):
     if not activities:
@@ -139,6 +217,7 @@ def normalize_activities(activities):
         max_hr = a.get("maxHR")
         avg_power = a.get("averagePower")
         max_power = a.get("maxPower")
+        np_power  = a.get("normalizedPower")
         avg_speed = a.get("averageSpeed")
 
         try:
@@ -156,6 +235,7 @@ def normalize_activities(activities):
             "max_hr": max_hr,
             "avg_power": avg_power,
             "max_power": max_power,
+            "np_power": np_power,
             "avg_speed_kmh": (avg_speed * 3.6) if isinstance(avg_speed, (int, float)) else None,
         })
 
@@ -179,6 +259,8 @@ def summarize(df):
         "total_distance_km": round(df["distance_km"].fillna(0).sum(), 2),
         "avg_hr": round(df["avg_hr"].dropna().mean(), 1) if df["avg_hr"].notna().any() else None,
         "avg_speed_kmh": round(df["avg_speed_kmh"].dropna().mean(), 1) if df["avg_speed_kmh"].notna().any() else None,
+        "avg_power": round(df["avg_power"].dropna().mean(), 0) if df["avg_power"].notna().any() else None,
+        "np_power": round(df["np_power"].dropna().mean(), 0) if df["np_power"].notna().any() else None,
     }
 
     by_type = (
@@ -189,12 +271,15 @@ def summarize(df):
               distance_km=("distance_km", lambda s: round(s.fillna(0).sum(), 2)),
               avg_hr=("avg_hr", "mean"),
               avg_speed_kmh=("avg_speed_kmh", "mean"),
+              avg_power=("avg_power", "mean"),
+              np_power=("np_power", "mean"),
           )
           .reset_index()
           .sort_values("time_hr", ascending=False)
     )
-    by_type["avg_hr"] = by_type["avg_hr"].round(1)
-    by_type["avg_speed_kmh"] = by_type["avg_speed_kmh"].round(1)
+    for col in ["avg_hr", "avg_speed_kmh", "avg_power", "np_power"]:
+        if col in by_type:
+            by_type[col] = by_type[col].round(1 if col in ["avg_hr", "avg_speed_kmh"] else 0)
     return totals, by_type
 
 def _to_naive_ts(dt):
@@ -250,6 +335,13 @@ if fetch_clicked:
             st.error(f"Failed to fetch activities: {e}")
             st.stop()
 
+    # ---------- NEW: hydrate detailed power metrics ----------
+    with st.spinner("Hydrating power metrics from activity details..."):
+        try:
+            activities = hydrate_power_metrics(client, activities, max_to_hydrate=int(hydrate_limit), sleep_sec=0.2)
+        except Exception as e:
+            st.warning(f"Could not hydrate detailed power for some activities: {e}")
+
     df = normalize_activities(activities)
     if df.empty:
         st.info("No activities found in the past week.")
@@ -264,18 +356,20 @@ if fetch_clicked:
     totals, by_type = summarize(df_week)
 
     st.subheader("📊 Weekly Totals")
-    c1, c2, c3, c4, c5 = st.columns(5)
+    c1, c2, c3, c4, c5, c6, c7 = st.columns(7)
     c1.metric("Activities", totals.get("activities", 0))
     c2.metric("Time (hr)", totals.get("total_time_hr", 0.0))
     c3.metric("Distance (km)", totals.get("total_distance_km", 0.0))
     c4.metric("Avg HR", totals.get("avg_hr", "—") if totals.get("avg_hr") is not None else "—")
     c5.metric("Avg Speed (km/h)", totals.get("avg_speed_kmh", "—") if totals.get("avg_speed_kmh") is not None else "—")
+    c6.metric("Avg Power (W)", totals.get("avg_power", "—") if totals.get("avg_power") is not None else "—")
+    c7.metric("NP (W)", totals.get("np_power", "—") if totals.get("np_power") is not None else "—")
 
     st.subheader("🗂️ By Activity Type")
     st.dataframe(by_type, use_container_width=True)
 
     st.subheader("📅 Activities (past 7 days)")
-    show_cols = ["date", "type", "name", "distance_km", "duration_min", "avg_hr", "max_hr", "avg_power", "max_power", "avg_speed_kmh"]
+    show_cols = ["date", "type", "name", "distance_km", "duration_min", "avg_hr", "max_hr", "avg_power", "max_power", "np_power", "avg_speed_kmh"]
     st.dataframe(df_week[show_cols], use_container_width=True)
 
     import matplotlib.pyplot as plt
@@ -310,5 +404,6 @@ if fetch_clicked:
     )
 else:
     st.info("Enter your Garmin credentials and click **Fetch past week** to begin.")
+
 
 
